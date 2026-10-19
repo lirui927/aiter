@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MiniMax-M3 TP4 decode resolves to tuned grouped-fmoe rows on gfx1250.
+"""MiniMax-M3 TP4 MoE resolves to tuned grouped-fmoe rows on gfx1250.
 
 Merges a temp copy of aiter/configs through the runtime get_config_file, then
-asks _find_grouped_config for the key the M3 per-rank decode call builds.
+asks _find_grouped_config for the key the M3 per-rank MoE call builds.
 
 Run:
     python3 -m pytest op_tests/test_grouped_fmoe_config_m3.py -v
@@ -72,8 +72,10 @@ class TestGroupedFmoeConfigM3(unittest.TestCase):
                     token_num=gm._get_padded_m(token_num), **key
                 )
 
-    def test_decode_tokens_hit_m3_rows(self):
-        for t in range(1, 17):
+    def test_every_padded_token_hits_m3_row(self):
+        # Every padded token (powers of two to 32768) plus T between them.
+        tokens = [*range(1, 17), *(1 << p for p in range(5, 16)), 100, 3000, 131071]
+        for t in tokens:
             with self.subTest(T=t):
                 row = self.lookup(t)
                 self.assertIsNotNone(row, "no tuned row; default 64x256x256 tile")
@@ -82,7 +84,7 @@ class TestGroupedFmoeConfigM3(unittest.TestCase):
                 self.assertEqual(int(row["token"]), gm._get_padded_m(t))
 
     def test_other_paths_unchanged(self):
-        for t in (1, 4, 16):
+        for t in (1, 4, 16, 1024, 32768):
             with self.subTest(T=t):
                 # EP keys on topk=-1; other archs never see gfx1250 rows.
                 for row in (self.lookup(t, topk=-1), self.lookup(t, gfx="gfx950")):
