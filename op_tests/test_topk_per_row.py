@@ -1006,16 +1006,20 @@ _FULL_NEXT_N = [1, 2, 3, 4]
 # Prefill's row count is not the decode context width. Wide coverage is a few
 # long rows, not a 128k-row tensor. FlyDSL rows are skipped where that kernel
 # is not served.
+# Wide rows of 100000 stay under the gfx950 `sampled` floor
+# (_SAMPLED_MIN_STRIDE0), so dispatch reaches the multi-block kernel; rows of
+# 131072 reach `sampled` there instead.
 _REPRESENTATIVE_PREFILL = (
     (8, 0, 512, False, False, False),
     (8, 0, 2048, False, False, False),
     (128, 0, 512, False, False, False),
     (128, 0, 2048, False, False, False),
     (128, 0, 2048, False, True, False),
-    (4, 131072, 512, False, False, False),
+    (4, 100000, 512, False, False, False),
+    (4, 100000, 2048, False, False, False),
+    (4, 100000, 2048, False, True, False),
     (4, 131072, 2048, False, False, False),
     (4, 131072, 2048, True, False, False),
-    (4, 131072, 2048, False, True, False),
     (8, 0, 2048, False, False, True),
     (128, 0, 512, False, False, True),
     (128, 0, 2048, False, False, True),
