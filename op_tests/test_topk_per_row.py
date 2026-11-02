@@ -994,82 +994,168 @@ def test_prefill_sampled_routing():
     print("[prefill_sampled_routing] PASS: by stride0 / rows / k / stable / env")
 
 
+# Historical benchmark matrix. `--full` (or any explicit shape flag) runs the
+# cartesian product. A bare `python3 op_tests/test_topk_per_row.py` does not:
+# standard CI uses the representative cases further down.
+_FULL_CONTEXT_LEN = [8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000]
+_FULL_TOP_K = [512, 1024, 2048]
+_FULL_BATCH = [4, 8, 16, 24]
+_FULL_NEXT_N = [1, 2, 3, 4]
+
+# (num_rows, num_prefix, top_k, stable, write_values, flydsl)
+# Prefill's row count is not the decode context width. Wide coverage is a few
+# long rows, not a 128k-row tensor. FlyDSL rows are skipped where that kernel
+# is not served.
+_REPRESENTATIVE_PREFILL = (
+    (8, 0, 512, False, False, False),
+    (8, 0, 2048, False, False, False),
+    (128, 0, 512, False, False, False),
+    (128, 0, 2048, False, False, False),
+    (128, 0, 2048, False, True, False),
+    (4, 131072, 512, False, False, False),
+    (4, 131072, 2048, False, False, False),
+    (4, 131072, 2048, True, False, False),
+    (4, 131072, 2048, False, True, False),
+    (8, 0, 2048, False, False, True),
+    (128, 0, 512, False, False, True),
+    (128, 0, 2048, False, False, True),
+    (128, 0, 2048, True, False, True),
+    (128, 0, 2048, False, True, True),
+    (128, 0, 2048, True, True, True),
+    (4, 131072, 512, False, False, True),
+    (4, 131072, 2048, False, False, True),
+    (4, 131072, 2048, True, True, True),
+)
+
+# (batch, context, k, next_n, stable, write_values, flydsl, ragged, fast)
+# One shape per kernel family: short rows, one-workgroup, split, unaligned
+# split, stable, value stores, ragged, and the gfx942 fast kernel.
+_REPRESENTATIVE_DECODE = (
+    (4, 8, 512, 1, False, False, False, False, False),
+    (4, 8, 2048, 1, False, False, False, False, False),
+    (4, 4096, 512, 1, False, False, False, False, False),
+    (4, 4096, 2048, 4, False, False, False, False, False),
+    (16, 4096, 2048, 1, False, False, False, False, False),
+    (4, 65536, 2048, 1, False, False, False, False, False),
+    (4, 90000, 512, 1, False, False, False, False, False),
+    (16, 90000, 2048, 4, False, False, False, False, False),
+    (4, 4096, 512, 1, False, True, False, False, False),
+    (4, 4096, 2048, 1, True, False, False, False, False),
+    (4, 4096, 2048, 1, False, True, False, False, False),
+    (4, 4096, 2048, 1, True, True, False, False, False),
+    (4, 65536, 2048, 1, True, True, False, False, False),
+    (4, 4096, 512, 1, False, False, True, False, False),
+    (4, 4096, 2048, 1, False, False, True, False, False),
+    (4, 4096, 2048, 1, True, True, True, False, False),
+    (4, 4096, 2048, 4, False, False, True, False, False),
+    (16, 4096, 2048, 1, False, False, True, False, False),
+    (4, 65536, 512, 1, False, False, True, True, False),
+    (4, 65536, 2048, 1, False, False, True, False, False),
+    (4, 65536, 2048, 1, False, False, True, True, False),
+    (4, 65536, 2048, 1, True, True, True, True, False),
+    (4, 90000, 2048, 1, False, False, True, True, False),
+    (4, 4096, 2048, 1, False, False, False, False, True),
+    (4, 65536, 2048, 1, False, False, False, False, True),
+)
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
+    description="""Top-k per row correctness and benchmark.
+
+With no shape flags, run the representative correctness cases.
+--full runs every combination of the historical shape lists.
+An explicit shape flag also runs that combination matrix.
+""",
+)
+parser.add_argument(
+    "--full",
+    action="store_true",
+    help=f"""Run the full combination matrix.
+    Defaults: -c {' '.join(map(str, _FULL_CONTEXT_LEN))}
+              -k {' '.join(map(str, _FULL_TOP_K))}
+              -b {' '.join(map(str, _FULL_BATCH))}
+              -n {' '.join(map(str, _FULL_NEXT_N))}""",
 )
 parser.add_argument(
     "-c",
     "--context_len",
     type=int,
-    default=[8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
+    default=None,
     nargs="+",
-    help="""number of kv.
-    e.g.: -c 64""",
+    help=f"""Context length for the combination matrix.
+    Prefill uses each value as its row count.
+    e.g.: -c 64
+    --full default: {' '.join(map(str, _FULL_CONTEXT_LEN))}""",
 )
 
 parser.add_argument(
     "-k",
     "--top_k",
     type=int,
-    default=[512, 1024, 2048],
+    default=None,
     nargs="+",
-    help="""top-k elements per row. The radix backend supports any positive
+    help=f"""top-k elements per row. The radix backend supports any positive
     int; the `_fast` ASM-kernel path only supports 2048 and is skipped
     for other values.
-    e.g.: -k 512 1024 2048""",
+    e.g.: -k 512 1024 2048
+    --full default: {' '.join(map(str, _FULL_TOP_K))}""",
 )
 
 parser.add_argument(
     "--num_prefix",
     type=int,
-    default=[0],
+    default=None,
     nargs="+",
-    help="""top-k elements per row.
-    e.g.: --num_prefix 8000 16000 24000 32000 40000 48000 56000""",
+    help="""Prefill row-start offset for the combination matrix.
+    e.g.: --num_prefix 8000 16000 24000 32000 40000 48000 56000
+    --full default: 0""",
 )
 
 parser.add_argument(
     "--prefill_backend",
     type=str,
-    default=["aiter"],
+    default=None,
     choices=["aiter", "sampled"],
     nargs="+",
     help="""which prefill selector to measure: `aiter` for
     top_k_per_row_prefill, `sampled` for top_k_per_row_prefill_sampled. Pass both to
     get one summary table with a row per backend per shape.
-    e.g.: --prefill_backend aiter sampled""",
+    e.g.: --prefill_backend aiter sampled
+    --full default: aiter""",
 )
 
 parser.add_argument(
     "-b",
     "--decode_batch_size",
     type=int,
-    default=[4, 8, 16, 24],
+    default=None,
     nargs="+",
-    help="""decode_batch_size batch size.
-    e.g.: -b 4""",
+    help=f"""decode_batch_size batch size.
+    e.g.: -b 4
+    --full default: {' '.join(map(str, _FULL_BATCH))}""",
 )
 
 parser.add_argument(
     "-n",
     "--next_n",
     type=int,
-    default=[1, 2, 3, 4],
+    default=None,
     nargs="+",
-    help="""next_n elements per sequence in a row.
-    e.g.: -n 4""",
+    help=f"""next_n elements per sequence in a row.
+    e.g.: -n 4
+    --full default: {' '.join(map(str, _FULL_NEXT_N))}""",
 )
 
 parser.add_argument(
     "-d",
     "--data_generation",
     type=str,
-    default=["random"],
+    default=None,
     choices=["random", "10LSBits", "mixed"],
     nargs="+",
     help="""Specify method for generating logits.
-    e.g.: -d random""",
+    e.g.: -d random
+    --full default: random""",
 )
 
 _REGRESSIONS = {
@@ -1098,103 +1184,199 @@ for name in args.regressions:
     _REGRESSIONS[name]()
 
 
+def _report(rows, what):
+    df = pd.DataFrame(rows)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("%s summary (markdown):\n%s", what, df_md)
+    assert df["all_close"].all(), f"{what} mismatch:\n{df_md}"
+
+
+def _run_representative(one_block_available, flydsl_decode_available):
+    gfx = get_gfx()
+    prefill = []
+    for (
+        num_rows,
+        num_prefix,
+        top_k,
+        stable,
+        write_values,
+        flydsl,
+    ) in _REPRESENTATIVE_PREFILL:
+        if flydsl and not one_block_available:
+            continue
+        prefill.append(
+            test_top_k_per_row_prefill(
+                num_rows,
+                num_prefix,
+                top_k,
+                "random",
+                flydsl=flydsl,
+                stable=stable,
+                write_values=write_values,
+            )
+        )
+    _report(prefill, "topk_per_row_prefill")
+
+    decode = []
+    for (
+        batch,
+        context,
+        top_k,
+        next_n,
+        stable,
+        write_values,
+        flydsl,
+        ragged,
+        fast,
+    ) in _REPRESENTATIVE_DECODE:
+        if flydsl and not flydsl_decode_available:
+            continue
+        if fast and gfx != "gfx942":
+            continue
+        decode.append(
+            test_top_k_per_row_decode(
+                batch,
+                context,
+                top_k,
+                next_n,
+                "random",
+                fast=fast,
+                flydsl=flydsl,
+                stable=stable,
+                write_values=write_values,
+                ragged=ragged,
+            )
+        )
+    _report(decode, "topk_per_row_decode")
+
+
+def _run_combination(
+    context_len,
+    top_k,
+    num_prefix,
+    prefill_backend,
+    decode_batch_size,
+    next_n,
+    data_generation,
+    one_block_available,
+    flydsl_decode_available,
+):
+    df = []
+    for generation in data_generation:
+        for m in context_len:
+            for k in top_k:
+                for prefix in num_prefix:
+                    for backend in prefill_backend:
+                        # Both ways round, matching the decode loop: the value
+                        # stores are a separate instantiation of the output
+                        # kernels, so skipping one leaves half of them untested.
+                        for write_values in (False, True):
+                            ret = test_top_k_per_row_prefill(
+                                m,
+                                prefix,
+                                k,
+                                generation,
+                                backend=backend,
+                                write_values=write_values,
+                            )
+                            df.append(ret)
+                    # Cover the one-block radix kernel directly, so a dispatch
+                    # change cannot hide a kernel regression.
+                    if not one_block_available:
+                        continue
+                    for stable in (False, True):
+                        for write_values in (False, True):
+                            ret = test_top_k_per_row_prefill(
+                                m,
+                                prefix,
+                                k,
+                                generation,
+                                flydsl=True,
+                                stable=stable,
+                                write_values=write_values,
+                            )
+                            df.append(ret)
+    _report(df, "topk_per_row_prefill")
+
+    df = []
+    for generation in data_generation:
+        for m in decode_batch_size:
+            for ctx in context_len:
+                for k in top_k:
+                    for n in next_n:
+                        for stable in (False, True):
+                            for write_values in (False, True):
+                                ret = test_top_k_per_row_decode(
+                                    m,
+                                    ctx,
+                                    k,
+                                    n,
+                                    generation,
+                                    stable=stable,
+                                    write_values=write_values,
+                                )
+                                df.append(ret)
+                                if flydsl_decode_available:
+                                    # Ragged lengths only matter once some rows
+                                    # are long enough to be split.
+                                    for ragged in (
+                                        (False, True) if ctx >= 65536 else (False,)
+                                    ):
+                                        ret = test_top_k_per_row_decode(
+                                            m,
+                                            ctx,
+                                            k,
+                                            n,
+                                            generation,
+                                            flydsl=True,
+                                            stable=stable,
+                                            write_values=write_values,
+                                            ragged=ragged,
+                                        )
+                                        df.append(ret)
+                            # `_fast` ASM kernel hardcodes k=2048 and is not stable.
+                            if get_gfx() == "gfx942" and k == 2048 and not stable:
+                                ret = test_top_k_per_row_decode(
+                                    m,
+                                    ctx,
+                                    k,
+                                    n,
+                                    generation,
+                                    fast=True,
+                                )
+                                df.append(ret)
+    _report(df, "topk_per_row_decode")
+
+
 # Ask each path which arches it serves rather than keeping a second copy
 # here: a copy drifts, and a test that drives a kernel production never
 # dispatches reports on something nobody runs.
 one_block_available = get_gfx() in _FLYDSL_TOPK_ONE_BLOCK_ARCHES
 flydsl_decode_available = get_gfx() in _FLYDSL_TOPK_DECODE_GATES
 
-df = []
-for data_generation in args.data_generation:
-    for m in args.context_len:
-        for k in args.top_k:
-            for num_prefix in args.num_prefix:
-                for backend in args.prefill_backend:
-                    # Both ways round, matching the decode loop: the value
-                    # stores are a separate instantiation of the output
-                    # kernels, so skipping one leaves half of them untested.
-                    for write_values in (False, True):
-                        ret = test_top_k_per_row_prefill(
-                            m,
-                            num_prefix,
-                            k,
-                            data_generation,
-                            backend=backend,
-                            write_values=write_values,
-                        )
-                        df.append(ret)
-                # Cover the one-block radix kernel directly, so a dispatch
-                # change cannot hide a kernel regression.
-                if not one_block_available:
-                    continue
-                for stable in (False, True):
-                    for write_values in (False, True):
-                        ret = test_top_k_per_row_prefill(
-                            m,
-                            num_prefix,
-                            k,
-                            data_generation,
-                            flydsl=True,
-                            stable=stable,
-                            write_values=write_values,
-                        )
-                        df.append(ret)
-
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
-assert df["all_close"].all(), f"topk_per_row_prefill mismatch:\n{df_md}"
-
-
-df = []
-for data_generation in args.data_generation:
-    for m in args.decode_batch_size:
-        for ctx in args.context_len:
-            for k in args.top_k:
-                for n in args.next_n:
-                    for stable in (False, True):
-                        for write_values in (False, True):
-                            ret = test_top_k_per_row_decode(
-                                m,
-                                ctx,
-                                k,
-                                n,
-                                data_generation,
-                                stable=stable,
-                                write_values=write_values,
-                            )
-                            df.append(ret)
-                            if flydsl_decode_available:
-                                # Ragged lengths only matter once some rows
-                                # are long enough to be split.
-                                for ragged in (
-                                    (False, True) if ctx >= 65536 else (False,)
-                                ):
-                                    ret = test_top_k_per_row_decode(
-                                        m,
-                                        ctx,
-                                        k,
-                                        n,
-                                        data_generation,
-                                        flydsl=True,
-                                        stable=stable,
-                                        write_values=write_values,
-                                        ragged=ragged,
-                                    )
-                                    df.append(ret)
-                        # `_fast` ASM kernel hardcodes k=2048 and is not stable.
-                        if get_gfx() == "gfx942" and k == 2048 and not stable:
-                            ret = test_top_k_per_row_decode(
-                                m,
-                                ctx,
-                                k,
-                                n,
-                                data_generation,
-                                fast=True,
-                            )
-                            df.append(ret)
-
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
-assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
+run_combination = args.full or any(
+    value is not None
+    for value in (
+        args.context_len,
+        args.top_k,
+        args.num_prefix,
+        args.prefill_backend,
+        args.decode_batch_size,
+        args.next_n,
+        args.data_generation,
+    )
+)
+if run_combination:
+    _run_combination(
+        args.context_len or _FULL_CONTEXT_LEN,
+        args.top_k or _FULL_TOP_K,
+        args.num_prefix or [0],
+        args.prefill_backend or ["aiter"],
+        args.decode_batch_size or _FULL_BATCH,
+        args.next_n or _FULL_NEXT_N,
+        args.data_generation or ["random"],
+        one_block_available,
+        flydsl_decode_available,
+    )
+else:
+    _run_representative(one_block_available, flydsl_decode_available)
