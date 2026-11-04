@@ -77,6 +77,9 @@ def _all_reduce_rmsnorm_kernel(
     # 32 + i. Then a store of a wave writes 512 contiguous bytes.
     line = gl.arange(0, 2 * N, layout=gl.SliceLayout(1, ROW))[:, None]
     i = line % N
+    # Line h * N + i contains columns 4i + 2h and 4i + 2h + 1. Both lines for
+    # a padded lane are invalid because supported hidden sizes are multiples of 4.
+    valid_line = (line < 2 * N) & (4 * i < HIDDEN)
     pos = 64 * (i // 32) + 32 * (line // N) + i % 32
     pos = 4 * pos + gl.arange(0, 4, layout=gl.SliceLayout(0, ROW))[None, :]
     if pid < triples:
@@ -90,11 +93,9 @@ def _all_reduce_rmsnorm_kernel(
             HIDDEN,
             calls + 2 * pid,
         )
-        # Post the padded tail too: every line must get the new tag, even when its
-        # payload is zero, or a receiver could observe an old call's tag.
-        _post(
-            lines, inboxes, 2 * HIDDEN_PAD * pid + pos, line < 2 * N, call, RANK, SLOT
-        )
+        # The receiver uses the same mask. Its masked loads synthesize zero values
+        # with the current tag, so the padding needs neither a store nor a fresh tag.
+        _post(lines, inboxes, 2 * HIDDEN_PAD * pid + pos, valid_line, call, RANK, SLOT)
     else:
         w = gl.amd.cdna5.buffer_load(weight, col, mask=valid_col, other=0).to(
             gl.float32
@@ -133,7 +134,7 @@ def _all_reduce_rmsnorm_kernel(
             s0, s1, s2 = _receive(
                 inboxes,
                 2 * HIDDEN_PAD * t + pos,
-                line < 2 * N,
+                valid_line,
                 call,
                 lines,
                 err,
