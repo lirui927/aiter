@@ -963,18 +963,25 @@ def test_route_gives_minus_one_routes_no_row(valid):
     assert rows[:valid].unique().numel() == valid * topk
 
 
-@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("quant", ["split_route", "compact", "route_in_quant"])
 @pytest.mark.parametrize("data_format", ["a4w4", "a8w4"])
-def test_grouped_skips_pad_rows_routed_to_minus_one(data_format, compact, monkeypatch):
+def test_grouped_skips_pad_rows_routed_to_minus_one(data_format, quant, monkeypatch):
     """Rows past num_local_tokens arrive routed to expert -1, as the router
     leaves them under num_valid_rows. The token-multidest quant (TP batches of
-    64+ tokens) must give them no grouped row: they come out 0, and the real
-    rows come out as they do when every row is real."""
+    64+ tokens), with the route in its own launch or in the quant, must give
+    them no grouped row: they come out 0, and the real rows come out as they
+    do when every row is real."""
     _require_gfx1250()
     from aiter.ops.flydsl import moe_kernels
 
-    getter = "_get_compiled_token_multidest_" + (
-        "compact_quant" if compact else "quant"
+    compact = quant == "compact"
+    getter = (
+        "_get_compiled_token_multidest_"
+        + {
+            "split_route": "quant",
+            "compact": "compact_quant",
+            "route_in_quant": "tp_route_quant",
+        }[quant]
     )
     original = getattr(moe_kernels, getter)
     calls = []
@@ -984,6 +991,8 @@ def test_grouped_skips_pad_rows_routed_to_minus_one(data_format, compact, monkey
         return original(*args, **kwargs)
 
     monkeypatch.setattr(moe_kernels, getter, counted)
+    fuse = "1" if quant == "route_in_quant" else "0"
+    monkeypatch.setenv("AITER_TDM_FUSE_TP_ROUTE_QUANT", fuse)
     if compact:
         # The compact-scale variant otherwise starts at 1024+ tokens.
         monkeypatch.setenv("AITER_FLYDSL_COMPACT_SCALE_MIN_TOKENS", "64")
