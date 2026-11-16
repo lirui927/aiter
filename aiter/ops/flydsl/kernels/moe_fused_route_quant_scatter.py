@@ -124,8 +124,8 @@ class _EpPsumScanStorage:
 
 # Widest expert count the in-block TP route serves: one counter per thread.
 TP_ROUTE_MAX_EXPERTS = BLOCK_THREADS
-# Most routes one quant block owns: a token-multidest block of 8 tokens, topk 8.
-TP_ROUTE_MAX_OWN = 64
+# Routes one quant block owns: one per warp of the route-indexed block.
+TP_ROUTE_MAX_OWN = BLOCK_THREADS // 32
 
 
 @fx.struct
@@ -2498,7 +2498,6 @@ def build_moe_token_multidest_quant_module(
     quant_mode: str = "fp4",
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
     ksplit: int = 1,
-    tp_route_slots: int = 0,
 ):
     """Quantize each token once and scatter the result to its ``topk`` routed rows.
 
@@ -2507,22 +2506,27 @@ def build_moe_token_multidest_quant_module(
     every destination. What it saves therefore grows with ``topk``, while what
     it costs -- one buffer descriptor per destination held live across the store
     pass -- grows with it too.
-
-    ``tp_route_slots > 0`` folds the TP route (``moe_route_psum_fused``) into
-    the K-split build: each block re-derives the per-expert counts and
-    tile-aligned starts in LDS from all ``topk_ids`` (``tp_route_slots`` ids
-    per thread) and gives its tokens' routes their rows, in route order within
-    each expert. The kernel then takes ``topk_ids``, ``masked_m``, ``psum_out``,
-    ``experts`` and ``tile_m`` after ``token_num`` and writes
-    ``topids_to_rows`` (y == 0 blocks), ``masked_m`` and ``psum`` (block 0, 0).
-    Ids outside ``[0, experts)`` keep ``DROPPED_ROUTE_ROW``.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
         raise NotImplementedError("token multidest quant requires gfx1250 pk8")
+    is_fp8 = L.is_fp8
+    use_native = L.use_native
+    use_pk8 = L.use_pk8
+    elems_per_lane = L.elems_per_lane
+    lanes_per_mx_block = L.lanes_per_mx_block
+    mx_dtype = L.mx_dtype
+    payload_bytes_per_row = L.payload_bytes_per_row
+    payload_bytes_per_block = L.payload_bytes_per_block
+    payload_bytes_per_lane = L.payload_bytes_per_lane
     wave_size = L.wave_size
     warps_per_block = L.warps_per_block
+    mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
+    mx_blocks_per_row = L.mx_blocks_per_row
+    rows_per_tile = L.rows_per_tile
+    dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     row_iters = L.block_iters
+    amax_shuffle_dists = L.amax_shuffle_dists
     # Splitting the row's K groups over grid.y is safe because an MX block scale
     # covers 32 contiguous elements: the slices need no cross-block reduction.
     if row_iters % ksplit:
@@ -2530,13 +2534,6 @@ def build_moe_token_multidest_quant_module(
             f"ksplit={ksplit} must divide the row's {row_iters} wave iterations"
         )
     block_iters = row_iters // ksplit
-    tp_route = tp_route_slots > 0
-    n_own = warps_per_block * topk
-    if tp_route and (ksplit < 2 or n_own > TP_ROUTE_MAX_OWN):
-        raise ValueError(
-            f"the TP route needs the K-split build and at most {TP_ROUTE_MAX_OWN} "
-            f"routes per block, got ksplit={ksplit} and {n_own} routes"
-        )
     # The staged chunks are a pipeline over the *block's* iterations, and a
     # split block has too few left to pay for one.
     if ksplit > 1:
@@ -2552,104 +2549,14 @@ def build_moe_token_multidest_quant_module(
     # Blocks 4k..4k+3 share one destination dword, so their e8m0 bytes go out as
     # a single packed store instead of four predicated byte stores. Needs the
     # pk8 geometry (4 lanes per MX block) to assemble them with xor-shuffles.
-    scale_pack_dwords = L.lanes_per_mx_block == 4
+    scale_pack_dwords = lanes_per_mx_block == 4
     module_name = (
         f"moe_token_multidest_quant_k{topk}_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}"
         f"{'_scpk' if scale_pack_dwords else ''}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
-        f"{f'_tproute{tp_route_slots}' if tp_route else ''}"
     )
-
-    def _quant_ctx(
-        hidden,
-        grouped_payload,
-        grouped_scale,
-        token_eff,
-        valid,
-        lane,
-        raw_rows,
-        **staging,
-    ):
-        """``_emit_quant_block_loop`` context of one warp: quantize row
-        ``token_eff`` of ``hidden`` once and store it to each live row of
-        ``raw_rows``. A warp past the last token, or one whose routes are all
-        dropped, gets zero-length destination descriptors, so the hardware
-        bounds check drops its stores. ``staging``: how the hidden row arrives.
-        """
-        c0_i32 = fx.Int32(0)
-        c16_i32 = fx.Int32(16)
-        rows, any_live = _token_multidest_live_rows(raw_rows)
-        token_live = valid & any_live
-        pay_records = token_live.select(fx.Int32(L.payload_bytes_per_row), c0_i32)
-        # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
-        scale_records = token_live.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
-        scales = [
-            _token_multidest_scale_base(
-                row,
-                fx.Int32(L.rows_per_tile),
-                fx.Int32(L.dst_scale_dwords_per_row),
-                c16_i32,
-            )
-            for row in rows
-        ]
-        c_lanes_per_block = fx.Int32(L.lanes_per_mx_block)
-        block_in_wave = lane // fx.Uint32(c_lanes_per_block)
-        lane_in_block = lane - block_in_wave * c_lanes_per_block
-        return SimpleNamespace(
-            i32=T.i32,
-            f32=T.f32,
-            block_iters=block_iters,
-            payload_base=fx.Int64(ptrtoint(grouped_payload)),
-            payload_bytes_per_row=L.payload_bytes_per_row,
-            hidden_base=fx.Int64(ptrtoint(hidden)),
-            feat_bytes_per_row=feat_dim * 2,
-            feat_row_i32=token_eff,
-            payload_num_records=pay_records,
-            prequantized=False,
-            payload_dwords_per_lane=L.payload_bytes_per_lane // 4,
-            src_scale_base=fx.Int64(0),
-            src_scale_bytes_per_row=0,
-            mx_blocks_per_wave_iter=L.mx_blocks_per_wave_iter,
-            mx_blocks_per_row=L.mx_blocks_per_row,
-            amax_shuffle_dists=L.amax_shuffle_dists,
-            is_fp8=L.is_fp8,
-            use_native=L.use_native,
-            use_pk8=L.use_pk8,
-            mx_dtype=L.mx_dtype,
-            c0_i32=c0_i32,
-            c1_i32=fx.Int32(1),
-            c4_i32=fx.Int32(4),
-            c23_i32=fx.Int32(23),
-            c254_i32=fx.Int32(254),
-            c0_f32=fx.Float32(0.0),
-            c_wave=fx.Int32(L.wave_size),
-            c_elems_per_lane=fx.Int32(L.elems_per_lane),
-            c_payload_bytes_per_block=fx.Int32(L.payload_bytes_per_block),
-            c_payload_bytes_per_lane=fx.Int32(L.payload_bytes_per_lane),
-            c_wmma_rep=fx.Int32(wmma_rep),
-            block_in_wave=block_in_wave,
-            lane_in_block=lane_in_block,
-            is_block_lead=lane_in_block == c0_i32,
-            payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
-            # Scale destinations; the payload keeps its own list above.
-            dests=[
-                SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
-                for row, sc in zip(rows, scales)
-            ],
-            scale_t=ptr_buf_tensor(
-                grouped_scale, fx.Int8, num_records_bytes=scale_records
-            ),
-            # The packed dword store needs a width-agnostic V#; it carries the same
-            # zero-on-invalid bound as the byte view above.
-            scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
-                fx.Int64(ptrtoint(grouped_scale)),
-                num_records_bytes=scale_records,
-            ),
-            scale_pack_dwords=scale_pack_dwords,
-            **staging,
-        )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def token_multidest_kernel(
@@ -2660,8 +2567,24 @@ def build_moe_token_multidest_quant_module(
         token_num: Int32,
     ):
         i32 = T.i32
+        f32 = T.f32
+
         c0_i32 = fx.Int32(0)
+        c1_i32 = fx.Int32(1)
+        c4_i32 = fx.Int32(4)
+        c16_i32 = fx.Int32(16)
+        c23_i32 = fx.Int32(23)
+        c254_i32 = fx.Int32(254)
+        c0_f32 = fx.Float32(0.0)
+
         c_wave = fx.Int32(wave_size)
+        c_payload_bytes_per_block = fx.Int32(payload_bytes_per_block)
+        c_payload_bytes_per_lane = fx.Int32(payload_bytes_per_lane)
+        c_dst_scale_dwords_per_row = fx.Int32(dst_scale_dwords_per_row)
+        c_wmma_rep = fx.Int32(wmma_rep)
+        c_rows_per_tile = fx.Int32(rows_per_tile)
+        c_lanes_per_block = fx.Int32(lanes_per_mx_block)
+        c_elems_per_lane = fx.Int32(elems_per_lane)
 
         tid = fx.Uint32(fx.thread_idx.x)
         bid = fx.Uint32(fx.block_idx.x)
@@ -2741,19 +2664,80 @@ def build_moe_token_multidest_quant_module(
         if token0 < fx.Uint32(token_num):
             rows_t = ptr_buf_tensor(topids_to_rows)
             route0 = token_eff * fx.Int32(topk)
-            qc = _quant_ctx(
-                hidden,
-                grouped_payload,
-                grouped_scale,
-                token_eff,
-                valid,
-                lane,
-                # Scalar loads: the route is wave-uniform, and landing each row
-                # in an SGPR is what keeps its destination descriptor uniform.
+            # Scalar loads: the route is wave-uniform, and landing each row in
+            # an SGPR is what keeps its destination descriptor uniform too.
+            rows, any_live = _token_multidest_live_rows(
                 [
                     fx.Int32(buf_scalar_load(rows_t, route0 + fx.Int32(k)))
                     for k in range_constexpr(topk)
+                ]
+            )
+            token_live = valid & any_live
+            pay_records = token_live.select(fx.Int32(payload_bytes_per_row), c0_i32)
+            # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
+            scale_records = token_live.select(fx.Int32(_SCALE_RSRC_MAX_BYTES), c0_i32)
+            scales = [
+                _token_multidest_scale_base(
+                    row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
+                )
+                for row in rows
+            ]
+
+            block_in_wave = lane // fx.Uint32(c_lanes_per_block)
+            lane_in_block = lane - block_in_wave * c_lanes_per_block
+            qc = SimpleNamespace(
+                i32=i32,
+                f32=f32,
+                block_iters=block_iters,
+                payload_base=fx.Int64(ptrtoint(grouped_payload)),
+                payload_bytes_per_row=payload_bytes_per_row,
+                hidden_base=fx.Int64(ptrtoint(hidden)),
+                feat_bytes_per_row=feat_dim * 2,
+                feat_row_i32=token_eff,
+                payload_num_records=pay_records,
+                prequantized=False,
+                payload_dwords_per_lane=payload_bytes_per_lane // 4,
+                src_scale_base=fx.Int64(0),
+                src_scale_bytes_per_row=0,
+                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                mx_blocks_per_row=mx_blocks_per_row,
+                amax_shuffle_dists=amax_shuffle_dists,
+                is_fp8=is_fp8,
+                use_native=use_native,
+                use_pk8=use_pk8,
+                mx_dtype=mx_dtype,
+                c0_i32=c0_i32,
+                c1_i32=c1_i32,
+                c4_i32=c4_i32,
+                c23_i32=c23_i32,
+                c254_i32=c254_i32,
+                c0_f32=c0_f32,
+                c_wave=c_wave,
+                c_elems_per_lane=c_elems_per_lane,
+                c_payload_bytes_per_block=c_payload_bytes_per_block,
+                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                c_wmma_rep=c_wmma_rep,
+                block_in_wave=block_in_wave,
+                lane_in_block=lane_in_block,
+                is_block_lead=lane_in_block == c0_i32,
+                payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
+                # Scale destinations; the payload keeps its own list above.
+                dests=[
+                    SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
+                    for row, sc in zip(rows, scales)
                 ],
+                # Zero-on-invalid bound: a dead token takes a zero-length
+                # descriptor rather than a branch.
+                scale_t=ptr_buf_tensor(
+                    grouped_scale, fx.Int8, num_records_bytes=scale_records
+                ),
+                # The packed dword store needs a width-agnostic V#; it carries
+                # the same zero-on-invalid bound as the byte view above.
+                scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(ptrtoint(grouped_scale)),
+                    num_records_bytes=scale_records,
+                ),
+                scale_pack_dwords=scale_pack_dwords,
                 hidden_chunks=max(1, tdm_hidden_chunks),
                 chunk_prefetch=chunk_prefetch,
                 hidden_lds_load=hidden_lds_load,
@@ -2789,141 +2773,6 @@ def build_moe_token_multidest_quant_module(
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
-
-    if tp_route:
-
-        @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
-        def token_multidest_tp_route_kernel(
-            hidden: fx.Pointer,
-            grouped_payload: fx.Pointer,
-            grouped_scale: fx.Pointer,
-            topids_to_rows: fx.Pointer,  # (token_num * topk,) int32 out
-            token_num: Int32,
-            topk_ids: fx.Pointer,  # (token_num * topk,) int32 in
-            masked_m: fx.Pointer,  # (experts,) int32 out
-            psum_out: fx.Pointer,  # (experts,) int32 out
-            experts: Int32,
-            tile_m: Int32,
-        ):
-            i32 = T.i32
-            c0_i32 = fx.Int32(0)
-            c_wave = fx.Int32(wave_size)
-            c_lanes_per_block = fx.Int32(L.lanes_per_mx_block)
-
-            tid = fx.Uint32(fx.thread_idx.x)
-            bid = fx.Uint32(fx.block_idx.x)
-            warp_in_block = fx.Uint32(
-                rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave))
-            )
-            lane = tid - warp_in_block * c_wave
-            token0 = bid * fx.Int32(warps_per_block)
-            token = token0 + warp_in_block
-            valid = token < fx.Uint32(token_num)
-            token_eff = valid.select(token, fx.Uint32(c0_i32))
-            block_in_wave = lane // fx.Uint32(c_lanes_per_block)
-            mx_group_base = fx.Uint32(fx.block_idx.y) * fx.Int32(block_iters)
-            hidden_base = fx.Int64(ptrtoint(hidden))
-            pf = SimpleNamespace(
-                feat_bytes_per_row=feat_dim * 2,
-                mx_blocks_per_wave_iter=L.mx_blocks_per_wave_iter,
-                block_in_wave=block_in_wave,
-                lane_in_block=lane - block_in_wave * c_lanes_per_block,
-                c_elems_per_lane=fx.Int32(L.elems_per_lane),
-            )
-            k0 = fx.Uint32(fx.block_idx.y) == 0
-            start, pre, own, hidden_loads = _emit_tp_route(
-                tid=tid,
-                ids=topk_ids,
-                numel=token_num * fx.Int32(topk),
-                experts=experts,
-                tile_m=tile_m,
-                first=fx.Uint32(token0) * fx.Uint32(topk),
-                n_own=n_own,
-                slots=tp_route_slots,
-                writer=(bid == 0) & k0,
-                masked_m=masked_m,
-                psum_out=psum_out,
-                prefetch=lambda: _emit_hidden_prefetch(
-                    pf, hidden_base, token_eff, mx_group_base, block_iters
-                ),
-            )
-
-            # Each route's rank among the block's earlier routes to its expert:
-            # lanes hold the block's ids, one ballot per 32 of them.
-            own_lanes = [
-                fx.Int32(own[lane + fx.Uint32(32 * h)])
-                for h in range_constexpr((n_own + wave_size - 1) // wave_size)
-            ]
-            raw_rows = []
-            for k in range_constexpr(topk):
-                pos = warp_in_block * fx.Uint32(topk) + fx.Uint32(k)
-                e = fx.Int32(rocdl.readfirstlane(i32, fx.Int32(own[pos])))
-                live = valid & (e >= c0_i32) & (e < fx.Int32(experts))
-                e_idx = live.select(e, c0_i32)
-                rank = fx.Int32(pre[e_idx])
-                for h, ids_h in enumerate(own_lanes):
-                    hit = ((lane + fx.Uint32(32 * h)) < pos) & (ids_h == e)
-                    rank = rank + fx.Int32(fx.ctpop(fx.Int32(rocdl.ballot(i32, hit))))
-                row = fx.Int32(rocdl.readfirstlane(i32, fx.Int32(start[e_idx]) + rank))
-                raw_rows.append(live.select(row, fx.Int32(DROPPED_ROUTE_ROW)))
-            rows_t = ptr_buf_tensor(topids_to_rows)
-            if valid & k0 & (lane == c0_i32):
-                route0 = token * fx.Uint32(topk)
-                for k in range_constexpr(topk):
-                    rows_t[route0 + fx.Uint32(k)] = raw_rows[k]
-
-            qc = _quant_ctx(
-                hidden,
-                grouped_payload,
-                grouped_scale,
-                token_eff,
-                valid,
-                lane,
-                raw_rows,
-                hidden_chunks=1,
-                chunk_prefetch=None,
-                hidden_lds_load=None,
-                hidden_lds_idx=None,
-                hidden_lds_row_off=c0_i32,
-                hidden_slot_bytes=0,
-                mx_group_base=mx_group_base,
-                hidden_preloaded=hidden_loads,
-            )
-            _emit_quant_block_loop(qc)
-
-        @flyc.jit
-        def launch_token_multidest_tp_route(
-            hidden: fx.Pointer,
-            grouped_payload: fx.Pointer,
-            grouped_scale: fx.Pointer,
-            topids_to_rows: fx.Pointer,
-            token_num: fx.Int32,
-            topk_ids: fx.Pointer,
-            masked_m: fx.Pointer,
-            psum_out: fx.Pointer,
-            experts: fx.Int32,
-            tile_m: fx.Int32,
-            grid_blocks: fx.Int32,
-            stream: fx.Stream = fx.Stream(None),  # noqa: B008
-        ):
-            token_multidest_tp_route_kernel(
-                hidden,
-                grouped_payload,
-                grouped_scale,
-                topids_to_rows,
-                token_num,
-                topk_ids,
-                masked_m,
-                psum_out,
-                experts,
-                tile_m,
-            ).launch(
-                grid=(fx.Int64(grid_blocks), fx.Int64(ksplit), 1),
-                block=(BLOCK_THREADS, 1, 1),
-                stream=stream,
-            )
-
-        launch_token_multidest = launch_token_multidest_tp_route
 
     launch_token_multidest.compile_hints = {
         "llvm_options": {

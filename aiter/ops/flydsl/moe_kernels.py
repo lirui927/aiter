@@ -3402,7 +3402,6 @@ def _get_compiled_token_multidest_quant(
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
-    tp_route_slots: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_module,
@@ -3415,7 +3414,6 @@ def _get_compiled_token_multidest_quant(
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
-        tp_route_slots=tp_route_slots,
     )
 
 
@@ -3801,9 +3799,6 @@ def flydsl_moe_fused_quant_preshuffle(
             row_starts_i32 = masked_m
             route_max_m_arg = 1
         token_num = numel // int(source_topk) if source_topk > 0 else 0
-        token_multidest_on = os.environ.get(
-            "AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1"
-        ) in ("1", "true", "True")
         use_token_multidest = (
             not prequantized
             and not payload_preshuffled
@@ -3813,50 +3808,9 @@ def flydsl_moe_fused_quant_preshuffle(
             and num_valid_routes is None
             and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
-            and token_multidest_on
+            and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
+            in ("1", "true", "True")
         )
-        if (
-            fuse_tp_route
-            and token_multidest_on
-            and row_to_token is None
-            and token_multidest_eligible(token_num, source_topk)
-        ):
-            from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
-                token_multidest_ksplit,
-            )
-
-            md_ksplit = token_multidest_ksplit(
-                feat_dim, wmma_rep, quant_mode, token_num
-            )
-            # The batch the unfused quant would hand to token-multidest: keep
-            # that kernel, with the route folded in. Its K-split build is the
-            # only one without TDM staging, which the route fusion relies on.
-            if md_ksplit > 1:
-                launch = _get_compiled_token_multidest_quant(
-                    feat_dim=feat_dim,
-                    wmma_rep=wmma_rep,
-                    topk=int(source_topk),
-                    quant_mode=quant_mode,
-                    tdm_hidden_chunks=0,
-                    ksplit=md_ksplit,
-                    tp_route_slots=_tp_route_slots(numel),
-                )
-                _dispatch_compiled(
-                    launch,
-                    ptr_arg(grouped_in.contiguous().view(-1)),
-                    ptr_arg(out_payload.view(-1)),
-                    ptr_arg(out_scale.view(-1)),
-                    ptr_arg(topids_to_rows_i32),
-                    token_num,
-                    ptr_arg(tp_ids_i32),
-                    ptr_arg(tp_m),
-                    ptr_arg(tp_psum),
-                    tp_experts,
-                    tp_tile_m,
-                    (token_num + warps_per_block - 1) // warps_per_block,
-                    current_stream_arg(),
-                )
-                return out_payload, out_scale
         if use_token_multidest and row_to_token is not None:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_tdm_chunks,
