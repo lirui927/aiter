@@ -3402,6 +3402,7 @@ def _get_compiled_token_multidest_quant(
     quant_mode: str,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
+    tp_route_slots: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_module,
@@ -3413,28 +3414,6 @@ def _get_compiled_token_multidest_quant(
         topk=topk,
         quant_mode=quant_mode,
         tdm_hidden_chunks=tdm_hidden_chunks,
-        ksplit=ksplit,
-    )
-
-
-@functools.cache
-def _get_compiled_token_multidest_tp_route_quant(
-    feat_dim: int,
-    wmma_rep: int,
-    topk: int,
-    quant_mode: str,
-    ksplit: int,
-    tp_route_slots: int,
-):
-    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
-        build_moe_token_multidest_tp_route_quant_module,
-    )
-
-    return build_moe_token_multidest_tp_route_quant_module(
-        feat_dim=feat_dim,
-        wmma_rep=wmma_rep,
-        topk=topk,
-        quant_mode=quant_mode,
         ksplit=ksplit,
         tp_route_slots=tp_route_slots,
     )
@@ -3853,11 +3832,12 @@ def flydsl_moe_fused_quant_preshuffle(
             # that kernel, with the route folded in. Its K-split build is the
             # only one without TDM staging, which the route fusion relies on.
             if md_ksplit > 1:
-                launch = _get_compiled_token_multidest_tp_route_quant(
+                launch = _get_compiled_token_multidest_quant(
                     feat_dim=feat_dim,
                     wmma_rep=wmma_rep,
                     topk=int(source_topk),
                     quant_mode=quant_mode,
+                    tdm_hidden_chunks=0,
                     ksplit=md_ksplit,
                     tp_route_slots=_tp_route_slots(numel),
                 )
